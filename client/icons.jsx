@@ -31,6 +31,7 @@ const shapes = {
   close: 'M6 6l12 12M18 6 6 18',
   alert: 'm12 3 10 17H2zm0 6v4m0 3h.01',
   copy: 'M8 8h12v12H8zM16 4H4v12',
+  trash: 'M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5',
   refresh: 'M20 7a9 9 0 1 0 .6 9M20 3v5h-5',
   arrow: 'M4 12h15m-6-6 6 6-6 6',
   link: 'M13.5 4.5a4 4 0 0 1 5.7 5.7l-3 3m-5.7 6.3a4 4 0 0 1-5.7-5.7l3-3m1 4.2 6.2-6.2',

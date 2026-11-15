@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { link, mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { createReadStream, existsSync, renameSync, rmSync } from 'node:fs'
+import { mkdir, open, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { categories, chatKinds, clockAt, MAX_ZIP_BYTES, mondayOf, validDay } from '../shared.js'
 import { analyze } from './analysis.js'
-import { archiveName, assertZip, chatNameFromArchive, collectBytes, InputError, readArchive } from './archive.js'
+import { archiveName, assertZip, chatNameFromArchive, collectBytes, InputError, isGenericChatName, readArchive } from './archive.js'
 import { Inbox } from './inbox.js'
-import { digest, dueReports, messageRows, reportWindow, Store } from './store.js'
+import { digest, dueReports, messageRows, reportWindow, sessionResultId, Store } from './store.js'
 
 export const ID = /^[a-f0-9]{64}$/
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/
@@ -30,6 +30,8 @@ export class Workbench {
   drain = null
   tick = null
   inboxError = ''
+  sessionCapture = Promise.resolve()
+  sessionError = ''
 
   constructor(directory, complete) {
     this.store = new Store(directory)
@@ -50,7 +52,7 @@ export class Workbench {
   async stop() {
     clearInterval(this.timer)
     this.controller.abort()
-    await Promise.allSettled([this.tick, this.drain])
+    await Promise.allSettled([this.tick, this.drain, this.sessionCapture])
     this.store.release(this.lease)
     this.store.close()
   }
@@ -62,22 +64,95 @@ export class Workbench {
     const id = digest(bytes)
     const previous = this.store.importById(id)
     if (previous) return { id, status: previous.status, duplicate: true }
-    // Hard-link a closed staging file into its content-addressed name. A crash
-    // can leave an orphan, and a retry can safely reuse the completed ZIP.
-    const target = join(this.archives, `${id}.zip`)
-    const temp = join(this.archives, `${randomUUID()}.tmp`)
+    if (ingress === 'inbox' && this.store.isArchiveRemoved(id)) return { id, status: 'removed', duplicate: true }
+    const temp = await this.stageArchive(bytes)
     try {
-      await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
-      await link(temp, target).catch(error => { if (error.code !== 'EEXIST') throw error })
+      this.controller.signal.throwIfAborted()
+      const result = this.store.enqueue({
+        id, filename, name: plain(name, 120) || chatNameFromArchive(filename), kind: kindOf(kind), ingress,
+      }, () => this.publishArchive(temp, id))
+      this.kick()
+      return result
     } finally {
       await rm(temp, { force: true })
     }
-    this.controller.signal.throwIfAborted()
-    const result = this.store.enqueue({
-      id, filename, name: plain(name, 120) || chatNameFromArchive(filename), kind: kindOf(kind), ingress,
+  }
+
+  async stageArchive(bytes) {
+    const path = join(this.archives, `${randomUUID()}.tmp`)
+    try {
+      await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
+      return path
+    } catch (error) {
+      await rm(path, { force: true })
+      throw error
+    }
+  }
+
+  publishArchive(temp, id) {
+    // Publication and cleanup both hold the SQLite writer lock for this hash path.
+    const path = join(this.archives, `${id}.zip`)
+    if (!existsSync(path)) renameSync(temp, path)
+  }
+
+  cleanArchives() {
+    this.store.cleanArchives(id => rmSync(join(this.archives, `${id}.zip`), { force: true }))
+  }
+
+  captureSession(result, readFile) {
+    const signal = this.controller.signal
+    if (signal.aborted) return
+    const pending = this.sessionCapture.then(async () => {
+      try {
+        await this.saveSession(result, readFile, signal)
+      } catch (error) {
+        signal.throwIfAborted()
+        this.sessionError = error instanceof InputError ? error.message : '微信流会话分析入库失败，可重新发送该批次。'
+        throw new InputError(this.sessionError)
+      }
     })
-    this.kick()
-    return result
+    this.sessionCapture = pending.catch(() => {})
+    return pending
+  }
+
+  async saveSession(result, readFile, signal) {
+    signal.throwIfAborted()
+    const id = sessionResultId(result.sessionId, result.endSeq)
+    if (this.store.hasHandledSessionResult(id)) return
+    const archives = new Map()
+    try {
+      const files = new Map(result.files.map(ref => [typeof ref === 'string' ? ref : ref.attachmentId, ref]))
+      for (const ref of files.values()) {
+        const file = await readFile(ref, signal)
+        if (!file) continue
+        const { name, chatName, batchId, stream } = file
+        const bytes = await collectBytes(stream, MAX_ZIP_BYTES, signal)
+        const filename = archiveName(name)
+        const { records } = await readArchive(bytes, { nativeOnly: true })
+        signal.throwIfAborted()
+        const archiveId = digest(bytes)
+        if (archives.has(archiveId)) continue
+        const temp = await this.stageArchive(bytes)
+        archives.set(archiveId, {
+          id: archiveId, filename, name: plain(chatName, 120), batchId,
+          kind: 'unknown', ingress: 'session', records, temp,
+        })
+      }
+      signal.throwIfAborted()
+      const deliveries = [...archives.values()]
+      for (const archive of deliveries) {
+        if (archive.batchId && isGenericChatName(archive.name)) {
+          archive.name = `微信转发 · ${digest(archive.batchId).slice(0, 12)}`
+        }
+      }
+      this.store.saveSessionResult({ id,
+        createdAt: new Date(result.time).toISOString(), reply: result.reply }, deliveries,
+      archive => this.publishArchive(archive.temp, archive.id))
+      this.kick()
+      this.sessionError = ''
+    } finally {
+      await Promise.all([...archives.values()].map(archive => rm(archive.temp, { force: true })))
+    }
   }
 
   kick() {
@@ -110,7 +185,7 @@ export class Workbench {
       } catch (error) {
         if (signal.aborted) return
         const message = error instanceof InputError || /^模型|^DSH|^请先/.test(error?.message ?? '')
-          ? error.message : '聊天归档处理失败，请在导入记录中重试。'
+          ? error.message : '聊天归档处理失败，请在归档记录中重试。'
         this.store.fail(job.id, this.lease, message)
       }
     }
@@ -131,6 +206,7 @@ export class Workbench {
         await this.inbox.scan((bytes, options) => this.enqueue(bytes, options), message => { inboxError = message }, signal)
       }
       this.inboxError = inboxError
+      this.cleanArchives()
       this.publishDue()
       this.kick()
     })().catch(() => {
@@ -140,7 +216,9 @@ export class Workbench {
     return this.tick
   }
 
-  status() { return { ...this.store.importStatus(), inboxPath: this.inbox.directory, inboxError: this.inboxError } }
+  status() {
+    return { ...this.store.importStatus(), inboxPath: this.inbox.directory, inboxError: this.inboxError, sessionError: this.sessionError }
+  }
 
   view(params) {
     const settings = this.store.settings()
@@ -152,14 +230,16 @@ export class Workbench {
     const { start, end } = reportWindow(period, day)
     const category = plain(params.get('category'), 32)
     const rawKind = params.get('kind')
-    const status = ['open', 'done'].includes(params.get('status')) ? params.get('status') : 'all'
+    const requestedStatus = params.get('status')
+    const status = ['all', 'open', 'done'].includes(requestedStatus) ? requestedStatus : category === 'followup' ? 'open' : 'all'
     const items = this.store.list({
       start, end, category, kind: rawKind === 'all' || !rawKind ? 'all' : kindOf(rawKind),
       query: plain(params.get('q'), 120), status, offset: offsetOf(params.get('offset')),
     })
     return {
       today, day: start, period, days, weeks: [...new Set(days.map(row => mondayOf(row.day)))],
-      report: this.store.report(period, day), ...items,
+      report: this.store.report(period, day), sessionResults: this.store.sessionResults(start, end), ...items,
+      ...(category === 'chats' ? { pendingArchives: this.store.pendingArchives() } : {}),
       inbox: this.status(),
     }
   }
@@ -181,8 +261,45 @@ export class Workbench {
   editChat(id, value) {
     const name = plain(value?.name, 120)
     if (!name) throw new InputError('请输入会话名称。')
+    if (!id) return this.store.createChat(name, kindOf(value?.kind))
     const chat = this.store.editChat(id, name, kindOf(value?.kind))
     if (chat === null) throw new InputError('这个会话名称已被使用。')
+    return chat
+  }
+
+  saveObservation(id, value) {
+    const title = plain(value?.title, 90)
+    const summary = plain(value?.summary, 500)
+    const category = value?.category
+    const priority = value?.priority
+    const day = value?.day
+    if (!title || !summary) throw new InputError('请输入标题和摘要。')
+    if (!categories.some(item => item.id === category) || ![1, 2, 3].includes(priority) || !validDay(day)) {
+      throw new InputError('请选择有效的分类、优先级和日期。')
+    }
+    return this.store.saveObservation(id, {
+      chatId: idOf(value?.chatId), category, title, summary, priority, day,
+      time: clockAt(this.store.settings().timeZone).time,
+      importance: plain(value?.importance, 500), nextStep: plain(value?.nextStep, 500),
+    })
+  }
+
+  deleteEntry(type, id) {
+    const removed = type === 'chat' ? this.store.deleteChat(id) : this.store.deleteArchive(id)
+    if (!removed) return false
+    this.cleanArchives()
+    return true
+  }
+
+  assignArchive(id, value) {
+    const kind = value?.kind == null ? '' : kindOf(value.kind)
+    const chatId = idOf(value?.chatId)
+    const name = plain(value?.name, 120)
+    if (value?.mode === 'new' && !name) throw new InputError('请输入新会话名称。')
+    if (value?.mode === 'existing' && !chatId) throw new InputError('请选择已有会话。')
+    if (!['new', 'existing'].includes(value?.mode)) throw new InputError('请选择会话归属。')
+    const chat = this.store.assignArchive(id, { chatId: value.mode === 'existing' ? chatId : '', name, kind })
+    this.kick()
     return chat
   }
 
@@ -190,6 +307,13 @@ export class Workbench {
     const row = this.store.importById(id)
     if (!row) return null
     const path = join(this.archives, `${id}.zip`)
-    return { filename: row.filename, bytes: (await stat(path)).size, stream: createReadStream(path) }
+    const handle = await open(path, 'r').catch(error => { if (error.code !== 'ENOENT') throw error })
+    if (!handle) return null
+    try {
+      return { filename: row.filename, bytes: (await handle.stat()).size, stream: handle.createReadStream() }
+    } catch (error) {
+      await handle.close()
+      throw error
+    }
   }
 }

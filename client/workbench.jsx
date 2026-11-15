@@ -1,13 +1,14 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { categories, mondayOf, shiftDay } from '../shared.js'
 import { copyText, request } from './api.js'
 import { cat, Empty, IconButton, Kind, number, shortDate } from './components.jsx'
-import { Chat, dayHeading, exportReport, Observation, Report } from './details.jsx'
-import { ChatDialog, ImportDialog, InboxDialog, SettingsDialog } from './dialogs.jsx'
+import { Chat, dayHeading, exportReport, Observation, Report, SessionResult } from './details.jsx'
+import { AssignArchiveDialog, ChatDialog, DeleteDialog, ImportDialog, InboxDialog, ObservationDialog, SettingsDialog } from './dialogs.jsx'
 import { Icon, Mark } from './icons.jsx'
+import { PaneDivider, usePaneWidths } from './panes.jsx'
 
 const NAV_ORDER = ['related', 'learning', 'topic', 'opportunity', 'self']
-const INBOX = { jobs: [], active: 0, inboxPath: '', inboxError: '' }
+const INBOX = { jobs: [], active: 0, pending: 0, inboxPath: '', inboxError: '' }
 const REPORT = { type: 'report' }
 
 function NavRow({ id, label, icon, count, current, onClick }) {
@@ -19,7 +20,7 @@ function NavRow({ id, label, icon, count, current, onClick }) {
 
 function Navigation({ data, category, choose, inbox, show, close }) {
   const stats = data?.report.stats
-  return <aside className="lj-sidebar" aria-label="聊笺分类">
+  return <aside className="lj-sidebar" id="lj-sidebar" aria-label="聊笺分类">
     <div className="lj-brand"><Mark color size={36} /><strong>聊笺</strong>
       <IconButton icon="close" label="关闭分类" onClick={close} />
     </div>
@@ -37,7 +38,7 @@ function Navigation({ data, category, choose, inbox, show, close }) {
       <NavRow id="saved" label="收藏" icon="star" count={stats?.saved ?? 0} current={category} onClick={() => choose('saved')} />
     </nav>
     <div className="lj-sidebar-bottom">
-      <NavRow id="inbox" label="导入记录" icon="inbox" count={inbox.active || undefined} onClick={() => show('inbox')} />
+      <NavRow id="inbox" label="归档记录" icon="inbox" count={inbox.active + inbox.pending || undefined} onClick={() => show('inbox')} />
       <NavRow id="settings" label="工作台设置" icon="settings" onClick={() => show('settings')} />
     </div>
   </aside>
@@ -72,7 +73,7 @@ function ItemRow({ item, chats, selected, open }) {
       <strong>{chats ? item.name : item.title}</strong>
       {!chats && <span className="lj-result-excerpt">{item.summary}</span>}
       <span className="lj-result-meta">
-        <span>{chats ? `${number(item.count)} 条消息 · ${shortDate(item.day)}` : `${item.chat} · ${shortDate(item.day)}`}</span>
+        <span>{chats ? `${number(item.count)} 条消息${item.day ? ` · ${shortDate(item.day)}` : ''}` : `${item.chat} · ${shortDate(item.day)}`}</span>
         {item.saved ? <Icon name="star" size={13} /> : null}
         {item.done ? <span className="lj-list-done"><Icon name="check" size={12} />已处理</span> : null}
         <Kind kind={item.kind} />
@@ -81,9 +82,15 @@ function ItemRow({ item, chats, selected, open }) {
   </button>
 }
 
-function Rows({ items, chats, grouped, title, selected, choose, collapsed, flip, countByCategory, next, more, loading }) {
+function Rows({ items, chats, grouped, title, selected, choose, edit, collapsed, flip, countByCategory, next, more, loading, pending }) {
+  if (!items.length && pending) return null
   if (!items.length) return <Empty icon={chats ? 'chat' : 'search'} title={loading ? '正在读取…' : chats ? '没有匹配的会话' : '暂无匹配的观察'} />
-  const render = item => <ItemRow key={item.id} item={item} chats={chats} selected={selected.id === item.id} open={choose} />
+  const render = item => {
+    const row = <ItemRow key={item.id} item={item} chats={chats} selected={selected.id === item.id} open={choose} />
+    return chats ? <div className="lj-chat-row" key={item.id}>{row}
+      <IconButton icon="pen" label={`标注会话 ${item.name}`} onClick={() => edit(item)} />
+    </div> : row
+  }
   return <>
     {grouped ? categories.map(item => {
       const rows = items.filter(row => row.category === item.id)
@@ -102,14 +109,14 @@ function Rows({ items, chats, grouped, title, selected, choose, collapsed, flip,
   </>
 }
 
-export function Workbench() {
+export function Workbench({ entry }) {
   const [data, setData] = useState(null)
   const [inbox, setInbox] = useState(INBOX)
-  const [filters, setFilters] = useState({ period: 'daily', day: '', category: 'all', kind: 'all', status: 'all' })
+  const [filters, setFilters] = useState({ period: 'daily', day: entry?.day ?? '', category: 'all', kind: 'all', status: 'all' })
   const [query, setQuery] = useState('')
   const [search, setSearch] = useState('')
-  const [target, setTarget] = useState(REPORT)
-  const [previous, setPrevious] = useState(null)
+  const [target, setTarget] = useState(entry ? { type: 'sessionResult', id: entry.id } : REPORT)
+  const [history, setHistory] = useState([])
   const [detail, setDetail] = useState(null)
   const [detailError, setDetailError] = useState('')
   const [loadError, setLoadError] = useState('')
@@ -124,6 +131,8 @@ export function Workbench() {
   const [loading, setLoading] = useState(true)
   const [dropping, setDropping] = useState(false)
   const reader = useRef(null)
+  const restore = useRef(null)
+  const panes = usePaneWidths()
   const list = useRef(null)
   const lastStatus = useRef('')
   const dragDepth = useRef(0)
@@ -136,6 +145,7 @@ export function Workbench() {
   function notify(message) { setToast(message) }
   const close = () => setDialog(null)
   const setFilter = value => setFilters(current => ({ ...current, ...value }))
+  const previous = history.at(-1)
 
   useEffect(() => {
     const timer = setTimeout(() => setSearch(query.trim()), 200)
@@ -191,14 +201,23 @@ export function Workbench() {
   useEffect(() => {
     if (target.type !== 'observation') return
     const controller = new AbortController()
-    setDetail(null)
     setDetailError('')
     request('observation', { id: target.id }, { signal: controller.signal }).then(setDetail)
       .catch(error => { if (!controller.signal.aborted) setDetailError(error.message) })
     return () => controller.abort()
-  }, [target.type, target.id])
+  }, [target.type, target.id, refresh])
 
-  useEffect(() => { if (reader.current) reader.current.scrollTop = 0 }, [target.type, target.id, target.anchor, data?.day, data?.period])
+  useLayoutEffect(() => {
+    if (restore.current) {
+      if (target.type === 'observation' && target.id !== detail?.id && !detailError) return
+      const { scroll, opener } = restore.current
+      restore.current = null
+      reader.current.scrollTop = scroll
+      const link = opener && reader.current.querySelector(`[data-reading-link="${CSS.escape(opener)}"]`)
+      const focus = link || reader.current
+      focus.focus({ preventScroll: true })
+    } else reader.current.scrollTop = 0
+  }, [target.type, target.id, target.anchor, data?.day, data?.period, detail?.id, detailError])
   useEffect(() => { if (list.current) list.current.scrollTop = 0 }, [filters, search])
   useEffect(() => {
     if (!toast) return
@@ -207,13 +226,28 @@ export function Workbench() {
   }, [toast])
 
   function navigate(next, pane = 'reading') {
-    setPrevious(null)
+    restore.current = null
+    setHistory([])
     setTarget(next)
     setMobile(pane)
   }
 
+  function drill(next, opener) {
+    if (target.type === 'report' && !filters.day && data?.day) setFilter({ day: data.day })
+    setHistory(current => [...current, { target, scroll: reader.current.scrollTop, opener }])
+    setTarget(next)
+    setMobile('reading')
+  }
+
+  function goBack() {
+    restore.current = previous
+    setHistory(current => current.slice(0, -1))
+    setTarget(previous.target)
+    setMobile('reading')
+  }
+
   function choose(category) {
-    setFilter({ category, ...(category === 'followup' ? { status: 'all' } : {}) })
+    setFilter({ category, status: category === 'followup' ? 'open' : 'all' })
     navigate(REPORT, 'list')
   }
 
@@ -232,10 +266,10 @@ export function Workbench() {
 
   function openObservation(id) { navigate({ type: 'observation', id }) }
 
+  function openResultChat(id, opener) { drill({ type: 'chat', id }, opener) }
+
   function openSource(source) {
-    setPrevious(target)
-    setTarget({ type: 'chat', id: source.chatId, anchor: source.id })
-    setMobile('reading')
+    drill({ type: 'chat', id: source.chatId, anchor: source.id }, source.id)
   }
 
   async function more() {
@@ -274,7 +308,7 @@ export function Workbench() {
     if (result.duplicates) parts.push(`跳过 ${result.duplicates} 个重复 ZIP`)
     if (parts.length) notify(parts.join('，'))
     update()
-    if (result.accepted) {
+    if (result.accepted && !dialog.chat) {
       setFilter({ day: '', category: 'all' })
       navigate(REPORT)
     }
@@ -287,21 +321,54 @@ export function Workbench() {
     copyText(lines.filter(Boolean).join('\n\n')).then(() => notify('观察已复制')).catch(error => notify(error.message))
   }
 
-  const hasDate = data?.report.stats.messages > 0
+  function savedObservation(item) {
+    if (!dialog.item) openObservation(item.id)
+    setDetail(item)
+    close()
+    update()
+    notify(dialog.item ? '观察已更新' : '记录已添加')
+  }
+
+  function savedChat(chat) {
+    if (dialog.returnTo === 'observation') show('observation', { initialChat: chat.id })
+    else {
+      if (!dialog.chat) navigate({ type: 'chat', id: chat.id })
+      close()
+    }
+    update()
+    notify(dialog.chat ? '会话已更新' : '会话已创建')
+  }
+
+  function removedEntry() {
+    const { entryType, item, returnTo } = dialog
+    if (target.id === item.id || (entryType === 'chat' && detail?.id === target.id && detail.chatId === item.id)) {
+      if (previous && previous.target.id !== item.id) goBack()
+      else navigate(REPORT)
+    }
+    if (returnTo?.type === 'inbox') show('inbox')
+    else close()
+    update()
+    notify({ chat: '会话已删除', archive: '归档已删除', observation: '观察已删除' }[entryType])
+  }
+
+  const hasDate = data?.report.stats.messages > 0 || data?.report.stats.observations > 0 || data?.sessionResults.length > 0
   const chats = filters.category === 'chats'
+  const pending = chats ? data?.pendingArchives ?? [] : []
   const followup = filters.category === 'followup'
   const title = cat(filters.category)?.label ?? ({ all: '全部观察', chats: '所有会话', saved: '收藏', followup: '跟进清单' }[filters.category])
   const stats = data?.report.stats
   const categoryCounts = { chats: stats?.allChats, saved: stats?.saved, followup: stats?.followup, all: stats?.observations, ...stats?.groups }
   const count = categoryCounts[filters.category] ?? 0
-  const filtered = Boolean(search) || filters.kind !== 'all' || (!chats && filters.status !== 'all')
+  const filtered = Boolean(search) || filters.kind !== 'all' || (!chats && filters.status !== (followup ? 'open' : 'all'))
   const sectionTitle = target.type === 'report' ? data?.period === 'weekly' ? '每周总览' : '每日总览'
-    : target.type === 'observation' ? '观察详情' : '原始会话'
+    : { observation: '观察详情', sessionResult: '微信流分析', chat: '原始会话' }[target.type]
   const byDate = data?.period === 'weekly' ? data?.weeks : data?.days.map(item => item.day)
   const before = byDate?.find(day => day < data.day)
   const after = byDate?.findLast(day => day > data.day)
 
-  return <div className="lj-workbench" data-mobile={mobile}
+  const backLabel = previous && { report: '返回简报', observation: '返回观察', sessionResult: '返回分析', chat: '返回会话' }[previous.target.type]
+
+  return <div className="lj-workbench" ref={panes.frame} style={panes.style} data-mobile={mobile}
     onDragEnter={event => {
       if (!event.dataTransfer.types.includes('Files') || dialog) return
       event.preventDefault()
@@ -318,13 +385,16 @@ export function Workbench() {
       show('upload', { files: Array.from(event.dataTransfer.files) })
     }}>
     <Navigation data={data} category={filters.category} choose={choose} inbox={inbox} show={show} close={() => setMobile('list')} />
+    <PaneDivider side="sidebar" panes={panes} label="调整分类栏宽度" controls="lj-sidebar" />
 
-    <section className="lj-list" aria-label="观察列表">
+    <section className="lj-list" id="lj-list" aria-label="观察列表">
       <header className="lj-bar lj-list-bar">
         <IconButton icon="list" label="打开分类" onClick={() => setMobile('nav')} className="lj-icon-button lj-mobile-only" />
         <h2>{title}</h2><span className="lj-count">{number(filtered ? data?.matches : count)}</span>
         <div className="lj-spacer" />
-        <IconButton icon="plus" label="导入 ZIP" onClick={() => show('upload')} />
+        <IconButton icon="plus" label={chats ? '新建会话' : followup ? '新建待办' : '新建观察'} disabled={!data}
+          onClick={() => show(chats ? 'chat' : 'observation')} />
+        <IconButton icon="upload" label="导入 ZIP" onClick={() => show('upload')} />
       </header>
       <div className="lj-controls">
         <div className="lj-period-row">
@@ -357,61 +427,90 @@ export function Workbench() {
               onClick={() => setMoreFilters(!moreFilters)} />}
           </div>
         </div>
-        {moreFilters && !chats && !followup && <div className="lj-status-filter">
+        {(moreFilters || followup) && !chats && <div className="lj-status-filter">
           {Object.entries({ all: '全部状态', open: '待处理', done: '已处理' }).map(([value, label]) =>
             <button key={value} type="button" aria-pressed={filters.status === value} onClick={() => setFilter({ status: value })}>{label}</button>)}
         </div>}
       </div>
       <div className="lj-results" ref={list} aria-busy={loading}>
+        {pending.length > 0 && <section className="lj-group" aria-label="待归类归档">
+          <h3 className="lj-group-caption">待归类 · {number(pending.length)}</h3>
+          {pending.map(file => <div key={file.id} className="lj-chat-row"><button type="button" className="lj-result" onClick={() => show('assign', { file })}>
+            <span className="lj-result-icon"><Icon name="file" size={17} /></span>
+            <span className="lj-result-content"><strong>{file.filename}</strong>
+              <span className="lj-result-meta">选择归属{file.chat && ` · 原归属 ${file.chat}`}</span></span>
+            <Icon name="right" size={15} />
+          </button><IconButton icon="trash" label={`删除归档 ${file.filename}`}
+            onClick={() => show('delete', { entryType: 'archive', item: file })} /></div>)}
+        </section>}
         {data && <Rows items={data.items} chats={chats} title={search ? '搜索结果' : title}
           grouped={grouped && filters.category === 'all'} countByCategory={!search && filters.kind === 'all' && filters.status === 'all' ? stats.groups : undefined}
           selected={target} collapsed={collapsed} flip={id => setCollapsed(value => ({ ...value, [id]: !value[id] }))}
           choose={item => chats ? navigate({ type: 'chat', id: item.id }) : openObservation(item.id)}
+          edit={chat => show('chat', { chat })} pending={pending.length > 0}
           next={data.next} more={more} loading={loading} />}
         {!data && !loadError && <p className="lj-list-loading" role="status">正在打开聊笺…</p>}
       </div>
     </section>
+    <PaneDivider side="list" panes={panes} label="调整列表栏宽度" controls="lj-list" />
 
     <section className="lj-main" aria-label="聊笺阅读区">
       <header className="lj-bar lj-reading-bar">
-        <IconButton icon="left" label="返回列表" onClick={() => setMobile('list')} className="lj-icon-button lj-mobile-only" />
-        {previous && <IconButton icon="left" label="返回观察" onClick={() => { setTarget(previous); setPrevious(null) }} />}
+        {!previous && <IconButton icon="left" label="返回列表" onClick={() => setMobile('list')} className="lj-icon-button lj-mobile-only" />}
+        {backLabel && <button type="button" className="lj-text-button lj-reading-back" onClick={goBack}>
+          <Icon name="left" size={15} />{backLabel}
+        </button>}
         <span>{sectionTitle}</span>
         <div className="lj-spacer" />
         {inbox.active > 0 && <button type="button" className="lj-job-pill" onClick={() => show('inbox')}><Icon name="clock" size={14} />{inbox.active} 份待分析</button>}
         {target.type === 'report' && data && <>
-          <IconButton icon="download" label="导出简报" disabled={!hasDate} onClick={() => exportReport(data.report, data.period === 'weekly')
+          <IconButton icon="download" label="导出简报" disabled={!hasDate} onClick={() => exportReport(data)
             .catch(error => notify(error.message))} />
           <span className="lj-bar-divider" />
           <IconButton icon="left" label="上一期简报" disabled={!before} onClick={() => selectDay(before)} />
           <IconButton icon="right" label="下一期简报" disabled={!after} onClick={() => selectDay(after)} />
         </>}
-        {target.type === 'observation' && <IconButton icon="file" label="返回简报" onClick={() => navigate(REPORT)} />}
-        <button type="button" className="lj-header-import" onClick={() => show('upload')}><Icon name="upload" size={15} />导入 ZIP</button>
+        {!previous && ['observation', 'sessionResult'].includes(target.type) && <IconButton icon="file" label="返回简报" onClick={() => navigate(REPORT)} />}
+        <button type="button" className="lj-header-import" onClick={() => show('inbox')}><Icon name="inbox" size={15} />归档记录</button>
       </header>
-      <div className="lj-reading-scroll" ref={reader}>
+      <div className="lj-reading-scroll" ref={reader} tabIndex={-1}>
         {loadError && <div className="lj-reading"><p className="lj-error" role="alert">{loadError}
           <button type="button" className="lj-text-button" onClick={update}>重试</button></p></div>}
-        {target.type === 'report' && data && <Report data={data} open={openObservation} upload={() => show('upload')}
+        {target.type === 'report' && data && <Report data={data} open={id => drill({ type: 'observation', id }, id)} showIntake={() => show('inbox')}
+          openResult={id => drill({ type: 'sessionResult', id }, id)}
           generating={busy === 'report'} generate={generate} />}
-        {target.type === 'observation' && (detail?.id === target.id
-          ? <Observation item={detail} toggle={mark} marking={Boolean(busy)} source={openSource} copy={copyObservation} />
-          : detailError ? <Empty icon="alert" title="观察加载失败">{detailError}</Empty> : <p className="lj-reading lj-loading" role="status">正在定位原消息…</p>)}
+        {target.type === 'observation' && (detailError ? <Empty icon="alert" title="观察加载失败">{detailError}</Empty>
+          : detail?.id === target.id ? <Observation item={detail} toggle={mark} marking={Boolean(busy)} source={openSource} copy={copyObservation}
+            edit={item => show('observation', { item })} remove={item => show('delete', { entryType: 'observation', item })} />
+          : <p className="lj-reading lj-loading" role="status">正在读取观察…</p>)}
+        {target.type === 'sessionResult' && <SessionResult key={target.id} id={target.id} refresh={refresh}
+          openChat={openResultChat} assign={file => show('assign', { file })} toast={notify} />}
         {target.type === 'chat' && <Chat key={`${target.id}:${target.anchor ?? ''}:${search}`} target={target} refresh={refresh}
-          query={search} edit={chat => show('chat', { chat })} />}
+          query={search} edit={chat => show('chat', { chat })} upload={chat => show('upload', { chat })} />}
       </div>
     </section>
 
     {dropping && <div className="lj-drag-screen"><Icon name="upload" size={32} /><strong>松开以导入微信 ZIP</strong></div>}
     {toast && <div role="status" className="lj-toast"><Icon name="message" size={16} />{toast}</div>}
-    {dialog?.type === 'upload' && <ImportDialog close={close} onImport={imported} inboxPath={inbox.inboxPath} initialFiles={dialog.files} />}
+    {dialog?.type === 'upload' && <ImportDialog close={close} onImport={imported} inboxPath={inbox.inboxPath} initialFiles={dialog.files} intoChat={dialog.chat} />}
     {dialog?.type === 'inbox' && <InboxDialog data={inbox} close={close} upload={() => show('upload')}
+      assign={file => show('assign', { file })}
+      remove={item => show('delete', { entryType: 'archive', item, returnTo: dialog })}
       changed={next => { setInbox(next); update() }} toast={notify} />}
+    {dialog?.type === 'assign' && <AssignArchiveDialog archive={dialog.file} close={close} saved={chat => {
+      close(); update(); notify(`已归入「${chat.name}」，正在整理观察`)
+    }} />}
     {dialog?.type === 'settings' && <SettingsDialog close={close} saved={() => { close(); update(); notify('设置已保存') }} />}
-    {dialog?.type === 'chat' && <ChatDialog chat={dialog.chat} close={close} saved={() => { close(); update(); notify('会话已更新') }} />}
+    {dialog?.type === 'chat' && <ChatDialog chat={dialog.chat} close={close} saved={savedChat}
+      remove={item => show('delete', { entryType: 'chat', item, returnTo: dialog })} />}
+    {dialog?.type === 'observation' && <ObservationDialog item={dialog.item} day={data?.day} initialChat={dialog.initialChat}
+      category={cat(filters.category)?.id ?? 'related'} followup={!dialog.item && followup} close={close} saved={savedObservation}
+      newChat={() => show('chat', { returnTo: 'observation' })} />}
+    {dialog?.type === 'delete' && <DeleteDialog entryType={dialog.entryType} item={dialog.item} removed={removedEntry}
+      close={() => setDialog(dialog.returnTo ?? null)} />}
   </div>
 }
 
 function statusSignature(data) {
-  return data.jobs.map(item => `${item.id}:${item.status}`).join(',')
+  return `${data.sessionRevision}|${data.pending}|${data.jobs.map(item => `${item.id}:${item.status}`).join(',')}`
 }

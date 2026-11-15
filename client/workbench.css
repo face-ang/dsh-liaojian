@@ -85,9 +85,20 @@ body[data-ds-dark-theme] .lj-root, [data-theme="dark"] .lj-root, .dark .lj-root 
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-columns: clamp(162px, 18%, 224px) clamp(284px, 28.4%, 360px) minmax(0, 1fr);
+  grid-template-columns: var(--lj-sidebar-width, clamp(162px, 18%, 224px))
+    var(--lj-list-width, clamp(284px, 28.4%, 360px)) minmax(0, 1fr);
   overflow: hidden;
 }
+
+.lj-pane-divider {
+  position: absolute; z-index: 1; inset-block: 0; width: 12px; transform: translateX(-50%);
+  cursor: col-resize; touch-action: none; user-select: none; outline: none;
+}
+.lj-pane-divider[data-side="sidebar"] { left: var(--lj-sidebar-width); }
+.lj-pane-divider[data-side="list"] { left: calc(var(--lj-sidebar-width) + var(--lj-list-width)); }
+.lj-pane-divider::after { content: ""; position: absolute; inset: 0 5px; background: transparent; }
+.lj-pane-divider:is(:hover, :focus-visible, [data-dragging="true"])::after { background: var(--lj-blue); }
+.lj-workbench:has(.lj-pane-divider[data-dragging="true"]) { cursor: col-resize; user-select: none; }
 
 .lj-sidebar { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--lj-line); background: var(--lj-nav); }
 .lj-brand { height: 58px; display: flex; align-items: center; gap: 9px; padding: 0 15px; flex: none; }
@@ -274,6 +285,22 @@ body[data-ds-dark-theme] .lj-root, [data-theme="dark"] .lj-root, .dark .lj-root 
 .lj-findings section { padding: 13px 0; border-top: 1px solid var(--lj-line); }
 .lj-findings section p { margin-top: 7px; color: var(--lj-muted); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.85; }
 .lj-findings .lj-next { margin-top: 4px; padding: 12px; border: 0; border-radius: 7px; color: var(--lj-green); background: var(--lj-green-bg); }
+.lj-chat-row { display: flex; align-items: center; }
+.lj-chat-row + .lj-chat-row { border-top: 1px solid var(--lj-line); }
+.lj-chat-row > .lj-result { flex: 1; min-width: 0; }
+.lj-chat-row > .lj-icon-button { flex: none; margin-right: 8px; }
+.lj-session-reply { overflow-wrap: anywhere; line-height: 1.7; }
+.lj-session-reply :is(h1, h2, h3, h4, h5, h6) { margin: 1.2em 0 .4em; line-height: 1.3; }
+.lj-session-reply h1 { font-size: 1.3em; }
+.lj-session-reply p { margin: 0 0 .85em; }
+.lj-session-reply :is(ul, ol) { margin: 0 0 .9em; padding-inline-start: 1.7em; }
+.lj-session-reply li + li { margin-top: .3em; }
+.lj-session-reply blockquote { margin: .85em 0; padding-inline-start: 1em; border-inline-start: 3px solid var(--lj-line); }
+.lj-session-reply :is(pre, table) { display: block; max-width: 100%; overflow-x: auto; }
+.lj-session-reply pre { padding: .75em; background: var(--lj-surface); border: 1px solid var(--lj-line); border-radius: 6px; }
+.lj-session-reply table { border-collapse: collapse; margin: .85em 0; }
+.lj-session-reply :is(th, td) { padding: .4em .7em; border: 1px solid var(--lj-line); text-align: start; }
+.lj-session-reply a { text-decoration: underline; }
 .lj-next h2 { display: flex; align-items: center; gap: 6px; }
 .lj-original { margin-top: 25px; min-width: 0; }
 .lj-message {
@@ -309,6 +336,14 @@ body[data-ds-dark-theme] .lj-root, [data-theme="dark"] .lj-root, .dark .lj-root 
 .lj-dialog > header { justify-content: space-between; border-bottom: 1px solid var(--lj-line); }
 .lj-dialog > header h2 { font-size: 16px; }
 .lj-dialog > footer { justify-content: flex-end; border-top: 1px solid var(--lj-line); }
+.lj-root .lj-danger { color: var(--lj-red); }
+.lj-root .lj-delete { background: var(--lj-red); border-color: var(--lj-red); }
+.lj-root .lj-delete:hover:not(:disabled) { background: color-mix(in srgb, var(--lj-red) 85%, var(--lj-ink)); }
+.lj-delete-name { overflow-wrap: anywhere; }
+.lj-delete-name + p { margin-top: 5px; }
+.lj-footer-start { margin-inline-end: auto; }
+.lj-reading-back { flex: none; white-space: nowrap; }
+.lj-archive-actions { display: flex; align-items: center; gap: 5px; flex: none; }
 .lj-dialog-body { padding: 14px 16px 18px; overflow: auto; min-height: 0; }
 .lj-form { display: grid; gap: 12px; }
 .lj-form > label, .lj-form-row > label { display: grid; align-content: start; gap: 4px; min-width: 0; font-weight: 610; }
@@ -366,7 +401,7 @@ body[data-ds-dark-theme] .lj-root, [data-theme="dark"] .lj-root, .dark .lj-root 
 }
 
 @container liaojian (max-width: 960px) {
-  .lj-workbench { grid-template-columns: 140px minmax(255px, 31%) minmax(0, 1fr); }
+  .lj-workbench { grid-template-columns: var(--lj-sidebar-width, 140px) var(--lj-list-width, minmax(255px, 31%)) minmax(0, 1fr); }
   .lj-controls { padding-inline: 9px; }
   .lj-bar { gap: 5px; padding-inline: 10px; }
   .lj-filter-group .lj-icon-button { width: 22px; }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-liaojian",
-  "version": "0.1.0",
-  "description": "聊笺 · 微信 AI 工作台。导入微信流聊天归档，生成简报、待办、商机和内容选题。",
+  "version": "0.2.4",
+  "description": "聊笺 · 微信 AI 工作台。接收微信流在 DeepSeek Harness 会话中的分析结果，归档微信原话。",
   "type": "module",
   "icon": "./icon.svg",
   "exports": {
@@ -11,22 +11,50 @@
     "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
-  "files": ["host/", "shared.js", "client/client.js", "cordis.patch.yml", "icon.svg", "locale/"],
-  "keywords": ["dsh-plugin", "deepseek-harness", "wechat", "wechatbridge"],
-  "engines": { "node": ">=24.9.0" },
+  "files": [
+    "host/",
+    "shared.js",
+    "client/client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "wechat",
+    "wechatbridge"
+  ],
+  "engines": {
+    "node": ">=24.9.0"
+  },
   "dsh": {
-    "engines": { "dsh": ">=0.2.2-rc.3 <0.3.0" },
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "engines": {
+      "dsh": ">=0.2.2-rc.3 <0.3.0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
-      "inject": ["@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-sidebar"],
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ],
       "platform": "web"
     }
   },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.js",
-    "prepack": "npm run build"
+    "prepare": "npm run build"
   },
-  "dependencies": { "yauzl": "3.4.0" },
-  "devDependencies": { "esbuild": "0.25.12" }
+  "dependencies": {
+    "yauzl": "3.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "markdown-it": "15.0.3"
+  }
 }

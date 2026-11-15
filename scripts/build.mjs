@@ -1,9 +1,11 @@
 import { build } from 'esbuild'
 import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 
 const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
 
 await build({
+  absWorkingDir: fileURLToPath(new URL('..', import.meta.url)),
   entryPoints: ['client/index.jsx'],
   outfile: 'client/client.js',
   bundle: true,

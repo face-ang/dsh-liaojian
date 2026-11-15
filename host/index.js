@@ -4,10 +4,11 @@ import { MAX_ZIP_BYTES } from '../shared.js'
 import { createComplete } from './analysis.js'
 import { archiveName, collectBytes, InputError } from './archive.js'
 import { workbenchRoute } from './http.js'
+import { watchSessionResults } from './session.js'
 import { Workbench } from './workbench.js'
 
 export const name = 'liaojian-workbench'
-export const inject = ['connection', 'llm', 'agentDefaultModel', 'commands', 'attachments']
+export const inject = ['connection', 'llm', 'agentDefaultModel', 'commands', 'attachments', 'sessions', 'sessionQuery']
 
 function command(ctx, workbench) {
   return ctx.commands.register({
@@ -57,7 +58,8 @@ export async function apply(ctx) {
   const workbench = new Workbench(directory, createComplete(ctx))
   const stop = await workbench.start()
   ctx.effect(() => stop, 'liaojian: storage and scheduler')
-  const fetch = workbenchRoute(workbench)
+  const recover = watchSessionResults(ctx, workbench)
+  const fetch = workbenchRoute(workbench, recover)
   ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/liaojian', methods: ['GET', 'POST'], requestBody: 'buffered', fetch,
   }), 'liaojian: workbench API')

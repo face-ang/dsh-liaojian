@@ -1,21 +1,22 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { categories, chatKinds, MAX_ZIP_BYTES } from '../shared.js'
+import { categories, chatKinds, MAX_ZIP_BYTES, WECHAT_SCENE_MARKER } from '../shared.js'
 import { copyText, request } from './api.js'
 import { ArchiveLink, Dialog, Empty, IconButton } from './components.jsx'
 import { Icon } from './icons.jsx'
 
-const statusLabel = { queued: '等待分析', running: '分析中', done: '已入库', failed: '需要重试' }
+const statusLabel = { pending: '待归类', queued: '等待分析', running: '分析中', done: '已入库', failed: '需要重试' }
+const ingressLabel = { session: 'DSH 会话', inbox: '微信流收件', command: 'DSH 命令', upload: '手动上传' }
 const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const fileSize = size => size >= 1_048_576 ? `${(size / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(size / 1024))} KB`
 
-export function ImportDialog({ close, onImport, inboxPath, initialFiles = [] }) {
+export function ImportDialog({ close, onImport, inboxPath, initialFiles = [], intoChat }) {
   const [files, setFiles] = useState(initialFiles)
   const [drag, setDrag] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [progress, setProgress] = useState('')
-  const [chat, setChat] = useState('')
-  const [kind, setKind] = useState('unknown')
+  const [chat, setChat] = useState(intoChat?.name ?? '')
+  const [kind, setKind] = useState(intoChat?.kind ?? 'unknown')
   const input = useRef(null)
 
   function add(candidate) {
@@ -97,7 +98,7 @@ export function ImportDialog({ close, onImport, inboxPath, initialFiles = [] }) 
   </Dialog>
 }
 
-export function InboxDialog({ data, close, upload, changed, toast }) {
+export function InboxDialog({ data, close, upload, assign, remove, changed, toast }) {
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   async function run(op, id) {
@@ -111,12 +112,20 @@ export function InboxDialog({ data, close, upload, changed, toast }) {
       setError(error.message)
     } finally { setBusy('') }
   }
-  return <Dialog title="导入记录" close={close} footer={<>
+  return <Dialog title="归档记录" close={close} footer={<>
     <button type="button" className="lj-secondary" disabled={Boolean(busy)} onClick={() => run('scan')}>
       <Icon name="refresh" />{busy === 'scan' ? '正在检查…' : '检查收件目录'}
     </button>
     <button type="button" className="lj-primary" onClick={upload}><Icon name="upload" />导入 ZIP</button>
   </>}>
+    <div className="lj-inbox-location">
+      <strong>从微信流转发到 DSH 会话</strong>
+      <div><code>{WECHAT_SCENE_MARKER}</code>
+        <IconButton icon="copy" label="复制场景标记" onClick={() => copyText(WECHAT_SCENE_MARKER)
+          .then(() => toast('场景标记已复制')).catch(error => setError(error.message))} />
+      </div>
+      <p className="lj-help">微信流贴入聊天记录后，在 DSH 输入框下点「存入聊笺」。已有此标记的场景也可以直接发送。</p>
+    </div>
     <div className="lj-inbox-location">
       <label>微信流收件目录</label>
       <div><code title={data.inboxPath}>{data.inboxPath}</code>
@@ -125,24 +134,87 @@ export function InboxDialog({ data, close, upload, changed, toast }) {
       </div>
       <p className="lj-help">在微信流的「沉淀到文件夹」里选择这个目录。DSH 打开时会接收这里的新 ZIP。</p>
     </div>
-    {(error || data.inboxError) && <p role="alert" className="lj-error">{error || data.inboxError}</p>}
-    {!data.jobs.length ? <Empty icon="inbox" title="还没有导入记录" /> : <ul className="lj-job-list">
+    {(error || data.sessionError || data.inboxError) && <p role="alert" className="lj-error">{error || data.sessionError || data.inboxError}</p>}
+    {!data.jobs.length ? <Empty icon="inbox" title="还没有归档记录" /> : <ul className="lj-job-list">
       {data.jobs.map(job => <li key={job.id}>
         <div className="lj-job-title"><Icon name={job.status === 'failed' ? 'alert' : 'file'} />
           <strong title={job.filename}>{job.filename}</strong><span data-status={job.status}>{statusLabel[job.status]}</span>
         </div>
         <div className="lj-job-meta">
-          <span>{job.chat} · {job.ingress === 'inbox' ? '微信流收件' : job.ingress === 'command' ? 'DSH 会话' : '手动上传'}</span>
+          <span>{[job.chat, ingressLabel[job.ingress] ?? '导入'].filter(Boolean).join(' · ')}</span>
           <time>{new Date(job.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>
         </div>
         <div className="lj-job-meta">
-          <span>{job.error || job.progress || (job.status === 'done' ? `新增 ${job.count} 条消息 · ${job.observations} 条观察` : '')}</span>
-          {job.status === 'failed'
+          <span>{job.error || job.progress || (job.status === 'done'
+            ? `新增 ${job.count} 条消息 · ${job.observations} 条观察`
+            : '')}</span>
+          <div className="lj-archive-actions">{job.status === 'pending' ? <button type="button" className="lj-text-button" onClick={() => assign(job)}>选择归属</button>
+            : job.status === 'failed'
             ? <button type="button" className="lj-text-button" disabled={Boolean(busy)} onClick={() => run('retry', job.id)}>重新分析</button>
             : job.status === 'done' && <ArchiveLink id={job.id} filename={job.filename} />}
+          <IconButton icon="trash" label={`删除归档 ${job.filename}`} onClick={() => remove(job)} disabled={Boolean(busy)} /></div>
         </div>
       </li>)}
     </ul>}
+  </Dialog>
+}
+
+export function AssignArchiveDialog({ archive, close, saved }) {
+  const [chats, setChats] = useState(null)
+  const [mode, setMode] = useState('')
+  const [name, setName] = useState('')
+  const [chatId, setChatId] = useState('')
+  const [kind, setKind] = useState('unknown')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    const controller = new AbortController()
+    request('archiveDestinations', {}, { signal: controller.signal }).then(setChats)
+      .catch(error => { if (!controller.signal.aborted) setError(error.message) })
+    return () => controller.abort()
+  }, [])
+
+  async function submit(event) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      const chat = await request('assignArchive', {}, { body: { id: archive.id, mode, name, chatId, kind } })
+      saved(chat)
+    } catch (error) { setError(error.message) } finally { setBusy(false) }
+  }
+
+  const ready = mode === 'new' ? name.trim() : mode === 'existing' && chatId
+  return <Dialog title="选择会话归属" close={() => { if (!busy) close() }} footer={<>
+    <button type="button" className="lj-secondary" onClick={close} disabled={busy}>取消</button>
+    <button type="submit" className="lj-primary" form="lj-assign-form" disabled={busy || !ready}>
+      {busy ? '正在保存…' : '保存并分析'}
+    </button>
+  </>}>
+    <form id="lj-assign-form" className="lj-form" onSubmit={submit}>
+      <p className="lj-help">{archive.filename}{archive.chat && ` · 原归属 ${archive.chat}`}</p>
+      <label>归档到<select required value={mode} disabled={busy} onChange={event => {
+        setMode(event.target.value)
+        setKind(event.target.value === 'existing' ? chats?.find(chat => chat.id === chatId)?.kind ?? 'unknown' : 'unknown')
+      }}>
+        <option value="" disabled>请选择</option>
+        <option value="new">新建会话</option>
+        <option value="existing" disabled={!chats?.length}>归入已有会话</option>
+      </select></label>
+      {mode === 'new' && <label>新会话名称<input required maxLength={120} value={name} disabled={busy}
+        onChange={event => setName(event.target.value)} /></label>}
+      {mode === 'existing' && <label>已有会话<select required value={chatId} disabled={busy} onChange={event => {
+        setChatId(event.target.value)
+        setKind(chats.find(chat => chat.id === event.target.value)?.kind ?? 'unknown')
+      }}>
+        <option value="" disabled>请选择会话</option>
+        {chats.map(chat => <option key={chat.id} value={chat.id}>{chat.name}</option>)}
+      </select></label>}
+      {mode && <label>会话类型<select value={kind} disabled={busy} onChange={event => setKind(event.target.value)}>
+        {Object.entries(chatKinds).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+      </select></label>}
+      {error && <p className="lj-error" role="alert">{error}</p>}
+    </form>
   </Dialog>
 }
 
@@ -195,7 +267,7 @@ export function SettingsDialog({ close, saved }) {
             ? [...value.categories, item.id] : value.categories.filter(id => id !== item.id))} />{item.label}</label>)}
       </div></fieldset>
       <label className="lj-check"><input type="checkbox" checked={value.inboxEnabled} onChange={event => change('inboxEnabled', event.target.checked)} />
-        自动接收微信流投递的 ZIP</label>
+        自动接收文件夹里的微信流 ZIP</label>
       <fieldset className="lj-schedules"><legend>定时汇总</legend>
         <div><label className="lj-check"><input type="checkbox" checked={value.daily.enabled} onChange={event => changeSchedule('daily', 'enabled', event.target.checked)} />日报</label>
           <span className="lj-help">汇总前一天</span>
@@ -214,9 +286,9 @@ export function SettingsDialog({ close, saved }) {
   </Dialog>
 }
 
-export function ChatDialog({ chat, close, saved }) {
-  const [name, setName] = useState(chat.name)
-  const [kind, setKind] = useState(chat.kind)
+export function ChatDialog({ chat, close, saved, remove }) {
+  const [name, setName] = useState(chat?.name ?? '')
+  const [kind, setKind] = useState(chat?.kind ?? 'unknown')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   async function save(event) {
@@ -224,12 +296,15 @@ export function ChatDialog({ chat, close, saved }) {
     setError('')
     setBusy(true)
     try {
-      const next = await request('chat', {}, { body: { id: chat.id, name, kind } })
+      const next = await request('chat', {}, { body: { id: chat?.id, name, kind } })
       saved(next)
     } catch (error) { setError(error.message) } finally { setBusy(false) }
   }
-  return <Dialog title="编辑会话" close={close} footer={<>
-    <button type="button" className="lj-secondary" onClick={close}>取消</button>
+  return <Dialog title={chat ? '编辑会话' : '新建会话'} close={() => { if (!busy) close() }} footer={<>
+    {chat && <button type="button" className="lj-text-button lj-danger lj-footer-start" disabled={busy} onClick={() => remove(chat)}>
+      <Icon name="trash" />删除会话
+    </button>}
+    <button type="button" className="lj-secondary" disabled={busy} onClick={close}>取消</button>
     <button type="submit" className="lj-primary" form="lj-chat-form" disabled={busy || !name.trim()}>保存</button>
   </>}>
     <form id="lj-chat-form" className="lj-form" onSubmit={save}>
@@ -239,5 +314,94 @@ export function ChatDialog({ chat, close, saved }) {
       </select></label>
       {error && <p role="alert" className="lj-error">{error}</p>}
     </form>
+  </Dialog>
+}
+
+export function ObservationDialog({ item, day, category, followup, initialChat, close, saved, newChat }) {
+  const editableSource = !item || item.origin === 'manual'
+  const [chats, setChats] = useState(null)
+  const [value, setValue] = useState(() => ({
+    id: item?.id, chatId: item?.chatId ?? initialChat ?? '', category: item?.category ?? category,
+    title: item?.title ?? '', summary: item?.summary ?? '', importance: item?.importance ?? '',
+    nextStep: item?.nextStep ?? '', priority: item?.priority ?? 2, day: item?.day ?? day,
+  }))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    if (!editableSource) return
+    const controller = new AbortController()
+    request('archiveDestinations', {}, { signal: controller.signal }).then(setChats)
+      .catch(error => { if (!controller.signal.aborted) setError(error.message) })
+    return () => controller.abort()
+  }, [editableSource])
+
+  const change = (field, next) => setValue(current => ({ ...current, [field]: next }))
+  async function save(event) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try { saved(await request('observation', {}, { body: value })) }
+    catch (error) { setError(error.message) }
+    finally { setBusy(false) }
+  }
+
+  return <Dialog title={item ? '编辑观察' : followup ? '新建待办' : '新建观察'} close={() => { if (!busy) close() }} footer={<>
+    <button type="button" className="lj-secondary" disabled={busy} onClick={close}>取消</button>
+    <button type="submit" className="lj-primary" form="lj-observation-form"
+      disabled={busy || !value.title.trim() || !value.summary.trim() || !value.chatId || !value.day}>保存</button>
+  </>}>
+    <form id="lj-observation-form" className="lj-form" onSubmit={save}>
+      {editableSource ? <div className="lj-form-row lj-form-halves">
+        <label>会话<select value={value.chatId} required disabled={busy || !chats?.length}
+          onChange={event => change('chatId', event.target.value)}>
+          <option value="" disabled>{chats ? '选择会话' : '正在读取…'}</option>
+          {chats?.map(chat => <option key={chat.id} value={chat.id}>{chat.name}</option>)}
+        </select></label>
+        <label>简报日期<input type="date" required value={value.day} onChange={event => change('day', event.target.value)} /></label>
+      </div> : <p className="lj-help">{item.chat} · {item.day}</p>}
+      {chats?.length === 0 && <button type="button" className="lj-text-button" onClick={newChat}><Icon name="plus" />先新建会话</button>}
+      <div className="lj-form-row lj-form-halves">
+        <label>分类<select value={value.category} onChange={event => change('category', event.target.value)}>
+          {categories.filter(item => !followup || ['related', 'opportunity'].includes(item.id)).map(item =>
+            <option key={item.id} value={item.id}>{item.label}</option>)}
+        </select></label>
+        <label>优先级<select value={value.priority} onChange={event => change('priority', Number(event.target.value))}>
+          <option value={1}>低</option><option value={2}>普通</option><option value={3}>高</option>
+        </select></label>
+      </div>
+      <label>标题<input required maxLength={90} value={value.title} onChange={event => change('title', event.target.value)} /></label>
+      <label>摘要<textarea rows="3" required maxLength={500} value={value.summary} onChange={event => change('summary', event.target.value)} /></label>
+      <label>下一步<textarea rows="2" maxLength={500} value={value.nextStep} onChange={event => change('nextStep', event.target.value)} /></label>
+      <label>关注理由<textarea rows="2" maxLength={500} value={value.importance} onChange={event => change('importance', event.target.value)} /></label>
+      {error && <p className="lj-error" role="alert">{error}</p>}
+    </form>
+  </Dialog>
+}
+
+const deletion = {
+  chat: ['会话', '会移除该会话在聊笺中的 ZIP 副本、消息和观察。包含这些 ZIP 的 DSH 分析也会从简报中移除。'],
+  archive: ['归档', '会移除聊笺中的 ZIP 副本、其中的消息、仅引用这些消息的观察，以及包含此 ZIP 的 DSH 分析。'],
+  observation: ['观察', '会从简报、分类、跟进清单和收藏中移除这条观察，原始消息会保留。'],
+}
+
+export function DeleteDialog({ entryType, item, close, removed }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [label, impact] = deletion[entryType]
+  async function confirm() {
+    setBusy(true)
+    setError('')
+    try {
+      await request(`delete${entryType[0].toUpperCase()}${entryType.slice(1)}`, {}, { body: { id: item.id } })
+      removed()
+    } catch (error) { setError(error.message) } finally { setBusy(false) }
+  }
+  return <Dialog title={`删除${label}`} close={() => { if (!busy) close() }} footer={<>
+    <button type="button" className="lj-secondary" disabled={busy} onClick={close}>取消</button>
+    <button type="button" className="lj-primary lj-delete" disabled={busy} onClick={confirm}>{busy ? '正在删除…' : '确认删除'}</button>
+  </>}>
+    <strong className="lj-delete-name">{item.name ?? item.title ?? item.filename}</strong>
+    <p className="lj-help">{impact}</p>
+    {error && <p className="lj-error" role="alert">{error}</p>}
   </Dialog>
 }

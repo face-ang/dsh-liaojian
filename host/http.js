@@ -1,6 +1,7 @@
 import { Readable } from 'node:stream'
 import { MAX_ZIP_BYTES, validDay } from '../shared.js'
 import { collectBytes, InputError } from './archive.js'
+import { sessionResultId } from './store.js'
 import { idOf, offsetOf } from './workbench.js'
 
 const headers = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
@@ -23,10 +24,22 @@ async function read(workbench, op, params) {
   switch (op) {
     case 'view': return json(workbench.view(params))
     case 'status': return json(workbench.status())
+    case 'archiveDestinations': return json(workbench.store.archiveDestinations())
     case 'settings': return json({ ...workbench.store.settings(), inboxPath: workbench.inbox.directory })
     case 'observation': {
       const item = workbench.store.observation(id)
       return item ? json(item) : missing()
+    }
+    case 'sessionResult': {
+      const result = workbench.store.sessionResult(id)
+      return result ? json(result) : missing()
+    }
+    case 'sessionResultLink': {
+      const session = params.get('session')
+      const raw = params.get('endSeq')
+      const endSeq = Number(raw)
+      if (!session || session.length > 200 || !/^\d+$/.test(raw) || !Number.isSafeInteger(endSeq)) return missing()
+      return json(workbench.store.sessionResultLink(sessionResultId(session, endSeq)) ?? null)
     }
     case 'chat': {
       const raw = params.get('anchor') ?? ''
@@ -48,7 +61,7 @@ async function read(workbench, op, params) {
   }
 }
 
-async function write(workbench, op, request, params) {
+async function write(workbench, recover, op, request, params) {
   const media = request.headers.get('content-type')?.split(';')[0]
   if (op === 'upload') {
     const hint = Number(request.headers.get('content-length'))
@@ -63,7 +76,14 @@ async function write(workbench, op, request, params) {
   const body = await readJson(request)
   const id = idOf(body?.id)
   switch (op) {
+    case 'sessionResultLink': {
+      if (!recover) return missing()
+      const { session, endSeq } = body ?? {}
+      if (typeof session !== 'string' || !session || session.length > 200 || !Number.isSafeInteger(endSeq) || endSeq < 0) return missing()
+      return json(await recover(session, endSeq, request.signal))
+    }
     case 'settings': return json(workbench.saveSettings(body))
+    case 'assignArchive': return id ? json(workbench.assignArchive(id, body)) : missing()
     case 'scan': await workbench.check(); return json(workbench.status())
     case 'retry': {
       if (!id || !workbench.store.retry(id)) return missing()
@@ -75,10 +95,19 @@ async function write(workbench, op, request, params) {
       const item = workbench.store.mark(id, body.field, body.value)
       return item ? json(item) : missing()
     }
-    case 'chat': {
-      const item = workbench.editChat(id, body)
-      return item ? json(item) : missing()
+    case 'observation': {
+      if (body?.id != null && !id) return missing()
+      const item = workbench.saveObservation(id, body)
+      return item ? json(item, id ? 200 : 201) : missing()
     }
+    case 'chat': {
+      if (body?.id != null && !id) return missing()
+      const item = workbench.editChat(id, body)
+      return item ? json(item, id ? 200 : 201) : missing()
+    }
+    case 'deleteObservation': return id && workbench.store.deleteObservation(id) ? json({ id }) : missing()
+    case 'deleteChat': return id && workbench.deleteEntry('chat', id) ? json({ id }) : missing()
+    case 'deleteArchive': return id && workbench.deleteEntry('archive', id) ? json({ id }) : missing()
     case 'report': {
       if (!validDay(body?.day) || !['daily', 'weekly'].includes(body?.period)) throw new InputError('请选择汇总日期。')
       return json(workbench.store.saveReport(body.period, body.day, true))
@@ -87,7 +116,7 @@ async function write(workbench, op, request, params) {
   }
 }
 
-export function workbenchRoute(workbench) {
+export function workbenchRoute(workbench, recover) {
   return async request => {
     const url = new URL(request.url)
     const params = url.searchParams
@@ -96,7 +125,7 @@ export function workbenchRoute(workbench) {
     try {
       if (!upload && op === 'upload') return missing()
       if (request.method === 'GET') return await read(workbench, op, params)
-      if (request.method === 'POST') return await write(workbench, op, request, params)
+      if (request.method === 'POST') return await write(workbench, recover, op, request, params)
       return json({ error: '请求方式无效。' }, 405)
     } catch (error) {
       if (error instanceof InputError) return json({ error: error.message }, 400)

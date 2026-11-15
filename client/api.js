@@ -10,8 +10,8 @@ export async function request(op, values, { signal, body, file } = {}) {
     body: file ?? (body !== undefined ? JSON.stringify(body) : undefined),
     signal,
   })
-  const data = await response.json().catch(() => null)
-  if (response.ok && data !== null) return data
+  const data = await response.json().catch(() => undefined)
+  if (response.ok && data !== undefined) return data
   if (response.status === 401 || response.status === 403) throw new Error('请在拥有者权限的 DSH 窗口中打开聊笺。')
   throw new Error(data?.error ?? '暂时无法连接聊笺，请重试。')
 }

@@ -1,7 +1,7 @@
 import { win32 } from 'node:path'
 import { crc32 } from 'node:zlib'
 import yauzl from 'yauzl'
-import { MAX_ZIP_BYTES, validDay } from '../shared.js'
+import { isZipName, MAX_ZIP_BYTES, validDay } from '../shared.js'
 
 const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 const MAX_ENTRIES = 4000
@@ -12,7 +12,7 @@ export class InputError extends Error {}
 
 export function archiveName(name) {
   const base = typeof name === 'string' ? win32.basename(name).trim() : ''
-  if (!/\.zip$/i.test(base)) throw new InputError('请选择微信合并转发导出的 ZIP 文件。')
+  if (!isZipName(base)) throw new InputError('请选择微信合并转发导出的 ZIP 文件。')
   const stem = base.slice(0, -4).replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, '_').slice(0, 170).toWellFormed()
   return `${stem || '微信聊天记录'}.zip`
 }
@@ -20,6 +20,8 @@ export function archiveName(name) {
 export function chatNameFromArchive(name) {
   return name.replace(/\.zip$/i, '').replace(/\s*\(\d+\)$/, '').trim() || '微信会话'
 }
+
+export const isGenericChatName = name => /^(?:微信(?:聊天记录|会话|流)?|聊天记录|wechat)?$/iu.test(name.trim())
 
 export async function collectBytes(stream, limit = MAX_ZIP_BYTES, signal) {
   const chunks = []
@@ -101,7 +103,7 @@ async function readTranscript(zip, entry) {
   return decodeTranscript(bytes)
 }
 
-export async function readArchive(bytes) {
+export async function readArchive(bytes, { nativeOnly = false } = {}) {
   assertZip(bytes)
   let zip
   try {
@@ -112,7 +114,9 @@ export async function readArchive(bytes) {
       })
     })
     if (zip.entryCount > MAX_ENTRIES) throw new InputError('ZIP 里的文件过多，请分批转发。')
-    for (const { entry, path, rank } of (await transcriptEntries(zip)).slice(0, 24)) {
+    const entries = await transcriptEntries(zip)
+    const candidates = nativeOnly ? entries.filter(({ rank }) => rank === 0) : entries
+    for (const { entry, path, rank } of candidates.slice(0, 24)) {
       try {
         const records = parseTranscript(await readTranscript(zip, entry))
         if (records.length) return { path, records }
